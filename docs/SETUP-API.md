@@ -207,6 +207,16 @@ code (`CA` stays California). Everything above applies to it unchanged, with the
 - **Credits.** Each region file lists every source with its licence and attribution; the Sources and permissions page
   (`build_packs.sources_page`) prints them.
 
+To rebuild just the crop layer offline, extract the crop classification GeoTIFF from the
+[Annual Crop Inventory download](https://open.canada.ca/data/en/dataset/89073037-d2fc-4a6d-9ce9-f0b1bcb48745).
+For BC in 2025, use `aci_2025_bc_v1.tif` from the BC archive. Set `--year` to match the input.
+This example builds a southern Okanagan sample in a separate output folder:
+
+```bash
+python tools/build_region_canada.py CA-BC crops --year 2025 --crop-geotiff /path/to/aci_2025_bc_v1.tif \
+  --bbox=-119.65,49.00,-119.51,49.19 --out /path/to/okanagan-sample
+```
+
 Build and publish a region (on the build machine):
 
 ```bash

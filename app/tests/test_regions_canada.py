@@ -240,6 +240,37 @@ class BuilderPieces(unittest.TestCase):
         self.assertEqual(self.tool.rings_of(poly), [[[(0, 0), (1, 0), (1, 1), (0, 0)]]])
         self.assertEqual(tuple(self.tool.point_of({'type': 'LineString', 'coordinates': [[0, 0], [1, 1], [2, 2]]})), (1, 1))
 
+    def test_crop_geotiff_builds_local_crop_points_and_tiles(self):
+        try:
+            import rasterio
+            import tifffile
+        except ImportError:
+            self.skipTest('requires the optional map build dependencies')
+        import numpy as np
+        from rasterio.transform import from_origin
+        from rasterio.warp import transform
+
+        [x], [y] = transform('EPSG:4326', 'EPSG:3005', [-119.55], [49.55])
+        data = np.zeros((100, 100), dtype=np.uint8)
+        data[10:90, 10:45] = 188   # orchard
+        data[10:90, 55:90] = 190   # vineyard
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            geotiff = out / 'annual crop inventory.tif'
+            with rasterio.open(geotiff, 'w', driver='GTiff', width=100, height=100, count=1, dtype='uint8',
+                               crs='EPSG:3005', transform=from_origin(x - 1500, y + 1500, 30, 30), nodata=0) as ds:
+                ds.write(data, 1)
+            args = ['builder', 'CA-BC', 'crops', '--crop-geotiff', str(geotiff),
+                    '--bbox=-119.59,49.52,-119.51,49.58', '--out', tmp]
+            with patch.object(sys, 'argv', args), patch.object(self.tool, 'CACHE', out), \
+                    patch('urllib.request.urlopen', side_effect=AssertionError('local crop build used the network')):
+                self.tool.main()
+
+            with closing(sqlite3.connect(out / 'crops.sqlite')) as db:
+                kinds = {kind for kind, in db.execute('SELECT DISTINCT kind FROM resource')}
+                self.assertEqual(kinds, {'orchard', 'vineyard'})
+                self.assertEqual(db.execute('SELECT MIN(z), MAX(z) FROM tile').fetchone(), (7, 13))
+
     def test_microsoft_only_build_skips_statcan_and_credits_the_footprints(self):
         sources = regions.get('CA-BC')['sources']['buildings']
         microsoft = next(s for s in sources if s['publisher'] == 'Microsoft')

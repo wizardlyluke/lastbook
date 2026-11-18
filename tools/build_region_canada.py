@@ -19,7 +19,8 @@ map, packaging/build_packs.py (region_set) and packaging/state_maps.py read it t
                                Columbia), from the BC Geographic Warehouse WFS. Dams keep name, type, height, year
                                and status; columns that name people (BC's owner and safety officer) are never read.
   crops      crops.sqlite      as tools/build_crops.py, from Agriculture and Agri-Food Canada's Annual Crop Inventory
-                               (OGL – Canada) image service: orchards, other fruit, vineyards and berries.
+                               (OGL – Canada): orchards, other fruit, vineyards and berries. --crop-geotiff uses a
+                               local Annual Crop Inventory GeoTIFF instead of the image service.
   buildings  buildings.sqlite  as tools/build_buildings.py, from Statistics Canada's Open Database of Buildings v3
                                (OGL – Canada; each municipal source and its licence is listed in the download's
                                ODB_v3_data_providers.csv). --ms fills zoom-14 cells ODB leaves empty with Microsoft's
@@ -37,7 +38,7 @@ Needs numpy, tifffile, rasterio (GDAL) and pyproj, as the build environment has 
 """
 import argparse, csv, io, json, math, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, urllib.parse, urllib.request, zipfile, zlib
 from array import array
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -399,9 +400,49 @@ ACI = {180: ('Fruits', 'orchard', (90, 150, 70)), 188: ('Orchards', 'orchard', (
 CROP_MAXZ, CROP_MINZ, BLOCK = 13, 7, 20
 
 
-def build_crops(code, r, box, out, year):
-    import numpy as np
+@contextmanager
+def crop_reader(r, year, crop_geotiff):
+    """Read crop windows on the same lon/lat grid from either source."""
     import rasterio
+    if crop_geotiff is None:
+        service = source(r, 'crops', 'Crop')['access'].format(year=year)
+
+        def read_window(box, width, height):
+            data = get(service + '/exportImage', {'bbox': ','.join(map(str, box)), 'bboxSR': 4326, 'imageSR': 4326,
+                                                 'size': f'{width},{height}', 'format': 'tiff', 'pixelType': 'U8',
+                                                 'interpolation': 'RSP_NearestNeighbor', 'f': 'image'})
+            with rasterio.MemoryFile(data) as mf, mf.open() as ds:
+                return ds.read(1), ds.transform
+
+        yield read_window
+        return
+
+    import numpy as np
+    from rasterio.transform import from_bounds
+    from rasterio.warp import Resampling, reproject
+
+    with rasterio.open(crop_geotiff, driver='GTiff') as ds:
+        if not ds.crs or ds.count != 1 or ds.dtypes[0] != 'uint8':
+            raise ValueError('--crop-geotiff needs a georeferenced Annual Crop Inventory GeoTIFF with one byte band')
+        band = rasterio.band(ds, 1)
+
+        def read_window(box, width, height):
+            transform = from_bounds(*box, width, height)
+            data = np.zeros((height, width), dtype=np.uint8)
+            reproject(band, data, dst_transform=transform, dst_crs='EPSG:4326', dst_nodata=0,
+                      resampling=Resampling.nearest)
+            return data, transform
+
+        yield read_window
+
+
+def build_crops(r, box, out, year, crop_geotiff=None):
+    with crop_reader(r, year, crop_geotiff) as read_window:
+        write_crops(r, box, out, year, read_window)
+
+
+def write_crops(r, box, out, year, read_window):
+    import numpy as np
     import build_crops as C          # png_rgba and down, the same overlay as the US
     codes = sorted(ACI)
     lut = np.zeros(256, np.uint8)
@@ -410,7 +451,6 @@ def build_crops(code, r, box, out, year):
     palette = np.zeros((len(codes) + 1, 4), np.uint8)
     for i, c in enumerate(codes, 1):
         palette[i] = (*ACI[c][2], 190)
-    service = source(r, 'crops', 'Crop')['access'].format(year=year)
     dest = out / 'crops.sqlite'
     db = sqlite3.connect(dest)
     db.executescript('''PRAGMA journal_mode=WAL; DROP TABLE IF EXISTS resource; DROP TABLE IF EXISTS spatial; DROP TABLE IF EXISTS tile;
@@ -425,11 +465,7 @@ def build_crops(code, r, box, out, year):
     for c in cells(box, 0.25):
         w, s, e, n = c
         width, height = max(1, round((e - w) / ARCSEC)), max(1, round((n - s) / ARCSEC))
-        data = get(service + '/exportImage', {'bbox': f'{w},{s},{e},{n}', 'bboxSR': 4326, 'imageSR': 4326, 'size': f'{width},{height}',
-                                             'format': 'tiff', 'pixelType': 'U8', 'interpolation': 'RSP_NearestNeighbor', 'f': 'image'})
-        with rasterio.MemoryFile(data) as mf, mf.open() as ds:
-            a = ds.read(1)
-            tr = ds.transform
+        a, tr = read_window(c, width, height)
         cls = lut[a]
         rows, cols = np.nonzero(cls)
         if not rows.size:
@@ -712,6 +748,7 @@ def main():
     ap.add_argument('--out', help='default derived/geo/regions/<code>')
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--year', type=int, default=2025, help='Annual Crop Inventory year')
+    ap.add_argument('--crop-geotiff', type=Path, help='local Annual Crop Inventory GeoTIFF for --year (instead of the image service)')
     ap.add_argument('--osm-gpkg', action='append', help='a local, unpacked Geofabrik GeoPackage (repeat for multiple extracts)')
     odb = ap.add_mutually_exclusive_group()
     odb.add_argument('--odb', nargs='*', help='local ODB_v3_*.zip or .gpkg files instead of downloading them')
@@ -719,6 +756,8 @@ def main():
     ap.add_argument('--ms', action='store_true', help='fill cells ODB leaves empty with Microsoft Canadian Building Footprints')
     ap.add_argument('--all-streams', action='store_true', help='every stream, not only named ones (much larger)')
     a = ap.parse_args()
+    if a.crop_geotiff is not None and not a.crop_geotiff.is_file():
+        ap.error('--crop-geotiff must name an existing local file')
     r = regions.get(a.code)
     box = tuple(map(float, a.bbox.split(','))) if a.bbox else regions.box(a.code)
     out = Path(a.out) if a.out else GEO / 'regions' / a.code
@@ -735,7 +774,7 @@ def main():
         elif layer == 'water':
             build_water(a.code, r, box, out, a.all_streams)
         elif layer == 'crops':
-            build_crops(a.code, r, box, out, a.year)
+            build_crops(r, box, out, a.year, a.crop_geotiff)
         elif layer == 'buildings':
             build_buildings(a.code, r, box, out, a.odb, a.ms, a.ms_only)
         elif layer == 'places':
